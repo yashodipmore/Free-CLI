@@ -1,33 +1,50 @@
 /**
- * @free-cli/cli — Chat Command
+ * @free-cli/cli — Chat Command (Phase 1)
  *
  * Interactive chat mode or one-shot prompt execution.
- * This is the primary command when users run `fcli` or `fcli "prompt"`.
+ * Features: markdown rendering, session persistence, enhanced slash commands,
+ * gradient welcome banner, and rich terminal output.
  */
 
 import chalk from 'chalk';
 import ora from 'ora';
+import boxen from 'boxen';
+import gradientString from 'gradient-string';
 import { input } from '@inquirer/prompts';
-import { generateId, now } from '@free-cli/core';
-import type { ConversationMessage, LLMStreamChunk } from '@free-cli/core';
+import { generateId, now, formatDuration } from '@free-cli/core';
+import type { ConversationMessage, LLMStreamChunk, TokenUsage } from '@free-cli/core';
 import { GroqProvider } from '../llm/groq.js';
 import { getConfig, getApiKey } from '../storage/config.js';
+import {
+  createSession,
+  addMessage,
+  getSessionMessages,
+  updateSession,
+  autoTitleSession,
+  listSessions,
+} from '../storage/sessions.js';
+import { renderMarkdown as _renderMarkdown } from '../ui/renderer.js';
 import { logger } from '../utils/logger.js';
 import { AuthenticationError } from '../utils/errors.js';
 
 /** ANSI escape to clear the current line */
 const CLEAR_LINE = '\x1B[2K\r';
 
+/** Session-level token accumulator */
+interface SessionState {
+  sessionId: string;
+  model: string;
+  tokens: TokenUsage;
+  messageCount: number;
+  startTime: number;
+}
+
 /**
  * Run the chat command — either interactive REPL or one-shot mode.
- *
- * @param prompt - If provided, runs in one-shot mode and exits.
- *                 If empty, starts the interactive REPL loop.
- * @param options - Command options (model, verbose, etc.)
  */
 export async function chatCommand(
   prompt: string | undefined,
-  options: { model?: string; verbose?: boolean },
+  options: { model?: string; verbose?: boolean; resume?: string },
 ): Promise<void> {
   // Check for API key
   const apiKey = await getApiKey('groq');
@@ -55,11 +72,11 @@ export async function chatCommand(
   }
 
   // Interactive REPL mode
-  await interactiveREPL(provider, model);
+  await interactiveREPL(provider, model, options.resume);
 }
 
 /**
- * Execute a single prompt and stream the response.
+ * Execute a single prompt and stream the response with markdown rendering.
  */
 async function executeOneShot(
   provider: GroqProvider,
@@ -81,24 +98,51 @@ async function executeOneShot(
     },
   ];
 
-  await streamResponse(provider, model, messages);
+  const result = await streamResponseWithMd(provider, model, messages);
+
+  if (result) {
+    logger.debug(`Response length: ${result.content.length} chars`);
+  }
 }
 
 /**
- * Run the interactive REPL loop.
+ * Run the interactive REPL loop with session persistence.
  */
-async function interactiveREPL(provider: GroqProvider, model: string): Promise<void> {
-  // Print welcome header
-  printWelcome(model);
+async function interactiveREPL(
+  provider: GroqProvider,
+  model: string,
+  resumeId?: string,
+): Promise<void> {
+  // Initialize or resume session
+  let messages: ConversationMessage[];
+  let sessionId: string;
 
-  const messages: ConversationMessage[] = [
-    {
-      id: generateId(),
-      role: 'system',
-      content: buildSystemPrompt(),
-      timestamp: now(),
-    },
-  ];
+  if (resumeId) {
+    const existingMessages = getSessionMessages(resumeId);
+    if (existingMessages.length === 0) {
+      console.error(chalk.yellow(`Session ${resumeId} not found. Starting new session.`));
+      sessionId = initNewSession(model);
+      messages = [createSystemMessage()];
+    } else {
+      sessionId = resumeId;
+      messages = existingMessages;
+      console.error(chalk.green(`✓ Resumed session ${sessionId.slice(0, 8)} (${existingMessages.length} messages)`));
+    }
+  } else {
+    sessionId = initNewSession(model);
+    messages = [createSystemMessage()];
+  }
+
+  const state: SessionState = {
+    sessionId,
+    model,
+    tokens: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    messageCount: messages.filter((m) => m.role !== 'system').length,
+    startTime: Date.now(),
+  };
+
+  // Print welcome header
+  printWelcome(state);
 
   // REPL loop
   while (true) {
@@ -116,7 +160,7 @@ async function interactiveREPL(provider: GroqProvider, model: string): Promise<v
       });
     } catch {
       // User pressed Ctrl+C or Ctrl+D
-      console.error(chalk.gray('\n👋 Goodbye!'));
+      await endSession(state);
       break;
     }
 
@@ -125,45 +169,63 @@ async function interactiveREPL(provider: GroqProvider, model: string): Promise<v
 
     // Handle slash commands
     if (trimmed.startsWith('/')) {
-      const handled = handleSlashCommand(trimmed, messages, model);
-      if (handled === 'exit') break;
-      if (handled === 'handled') continue;
+      const result = await handleSlashCommand(trimmed, messages, state, provider);
+      if (result === 'exit') {
+        await endSession(state);
+        break;
+      }
+      if (result === 'handled') continue;
     }
 
     // Add user message
-    messages.push({
+    const userMsg: ConversationMessage = {
       id: generateId(),
       role: 'user',
       content: trimmed,
       timestamp: now(),
-    });
+    };
+    messages.push(userMsg);
+    addMessage(sessionId, userMsg);
+    state.messageCount++;
 
     // Stream AI response
-    const response = await streamResponse(provider, model, messages);
+    const result = await streamResponseWithMd(provider, model, messages);
 
     // Add assistant response to history
-    if (response) {
-      messages.push({
+    if (result) {
+      const assistantMsg: ConversationMessage = {
         id: generateId(),
         role: 'assistant',
-        content: response,
+        content: result.content,
         timestamp: now(),
-      });
+      };
+      messages.push(assistantMsg);
+      addMessage(sessionId, assistantMsg);
+      state.messageCount++;
+
+      // Track tokens
+      if (result.usage) {
+        state.tokens.promptTokens += result.usage.promptTokens;
+        state.tokens.completionTokens += result.usage.completionTokens;
+        state.tokens.totalTokens += result.usage.totalTokens;
+      }
+
+      // Auto-title after first exchange
+      if (state.messageCount === 2) {
+        autoTitleSession(sessionId, trimmed);
+      }
     }
 
     console.error(''); // Blank line between turns
   }
 }
 
-/**
- * Stream a response from the LLM and print it to the terminal.
- * Returns the full response text.
- */
-async function streamResponse(
+/** Stream response and return content + usage. */
+async function streamResponseWithMd(
   provider: GroqProvider,
   model: string,
   messages: ConversationMessage[],
-): Promise<string | null> {
+): Promise<{ content: string; usage?: TokenUsage } | null> {
   const spinner = ora({
     text: chalk.gray('Thinking...'),
     spinner: 'dots',
@@ -172,6 +234,7 @@ async function streamResponse(
 
   let fullContent = '';
   let firstToken = true;
+  let usage: TokenUsage | undefined;
 
   try {
     const stream = provider.chatStream({
@@ -193,8 +256,8 @@ async function streamResponse(
         process.stdout.write(chunk.content);
       }
 
-      // Log usage on final chunk
       if (chunk.done && chunk.usage) {
+        usage = chunk.usage;
         logger.debug(
           `Tokens — prompt: ${chunk.usage.promptTokens}, completion: ${chunk.usage.completionTokens}, total: ${chunk.usage.totalTokens}`,
         );
@@ -202,7 +265,6 @@ async function streamResponse(
     }
 
     if (firstToken) {
-      // No content tokens were received
       spinner.stop();
     }
 
@@ -211,7 +273,7 @@ async function streamResponse(
       process.stdout.write('\n');
     }
 
-    return fullContent || null;
+    return fullContent ? { content: fullContent, usage } : null;
   } catch (error) {
     spinner.fail(chalk.red('Error'));
 
@@ -226,31 +288,95 @@ async function streamResponse(
 
 /**
  * Handle slash commands inside the REPL.
- * Returns 'exit' to quit, 'handled' if the command was processed, or 'unhandled'.
  */
-function handleSlashCommand(
+async function handleSlashCommand(
   command: string,
   messages: ConversationMessage[],
-  model: string,
-): 'exit' | 'handled' | 'unhandled' {
+  state: SessionState,
+  _provider: GroqProvider,
+): Promise<'exit' | 'handled' | 'unhandled'> {
   const parts = command.split(/\s+/);
   const cmd = parts[0]?.toLowerCase();
 
   switch (cmd) {
     case '/exit':
     case '/quit':
-      console.error(chalk.gray('👋 Goodbye!'));
       return 'exit';
 
     case '/clear':
-      // Keep only the system message
       messages.length = 1;
+      state.messageCount = 0;
+      state.tokens = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
       console.error(chalk.gray('🧹 Conversation cleared.'));
       return 'handled';
 
-    case '/model':
-      console.error(chalk.gray(`Current model: ${chalk.cyan(model)}`));
+    case '/reset': {
+      messages.length = 0;
+      messages.push(createSystemMessage());
+      state.sessionId = initNewSession(state.model);
+      state.messageCount = 0;
+      state.tokens = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      state.startTime = Date.now();
+      console.error(chalk.gray('🔄 New session started.'));
       return 'handled';
+    }
+
+    case '/model': {
+      const newModel = parts[1];
+      if (newModel) {
+        state.model = newModel;
+        console.error(chalk.gray(`Model switched to: ${chalk.cyan(newModel)}`));
+      } else {
+        console.error(chalk.gray(`Current model: ${chalk.cyan(state.model)}`));
+        console.error(chalk.gray('  Switch with: /model <model-id>'));
+        console.error(chalk.gray('  Available: llama-3.3-70b-versatile, llama-3.1-8b-instant'));
+      }
+      return 'handled';
+    }
+
+    case '/history':
+    case '/sessions': {
+      const sessions = listSessions(10);
+      if (sessions.length === 0) {
+        console.error(chalk.gray('No session history yet.'));
+      } else {
+        console.error(chalk.bold('\n  Recent Sessions:'));
+        for (const s of sessions) {
+          const date = new Date(s.updatedAt).toLocaleDateString();
+          const time = new Date(s.updatedAt).toLocaleTimeString();
+          const active = s.id === state.sessionId ? chalk.green(' (active)') : '';
+          console.error(
+            chalk.gray(`  ${s.id.slice(0, 8)}`) +
+              ` ${s.title}` +
+              chalk.gray(` — ${date} ${time}`) +
+              active,
+          );
+        }
+        console.error('');
+      }
+      return 'handled';
+    }
+
+    case '/tokens': {
+      console.error(chalk.bold('\n  Token Usage:'));
+      console.error(chalk.gray('  Prompt tokens:     ') + chalk.yellow(state.tokens.promptTokens.toLocaleString()));
+      console.error(chalk.gray('  Completion tokens: ') + chalk.yellow(state.tokens.completionTokens.toLocaleString()));
+      console.error(chalk.gray('  Total tokens:      ') + chalk.bold.yellow(state.tokens.totalTokens.toLocaleString()));
+      console.error(chalk.gray('  Session duration:  ') + formatDuration(Date.now() - state.startTime));
+      console.error('');
+      return 'handled';
+    }
+
+    case '/compact': {
+      const keepCount = parseInt(parts[1] || '6', 10);
+      const systemMsg = messages[0];
+      const recent = messages.slice(-keepCount);
+      messages.length = 0;
+      if (systemMsg) messages.push(systemMsg);
+      messages.push(...recent);
+      console.error(chalk.gray(`📦 Context compacted to ${messages.length} messages.`));
+      return 'handled';
+    }
 
     case '/tools':
       console.error(chalk.gray('🔧 Tools will be available in Phase 2.'));
@@ -290,19 +416,90 @@ You are powered by Groq's LPU inference engine for blazing-fast responses.
 - If you need to explain something, use bullet points
 - For file edits, show the exact changes needed
 - If asked about your capabilities, mention you can help with coding, debugging, file operations, and general knowledge
-- You are in Phase 0 — basic chat only. Tool calling (file read/write, shell, git, etc.) will be available in later phases.
+- You are in Phase 1 — interactive chat with rich terminal output. Full agentic tool calling is coming in Phase 2.
+
+## Response Formatting
+- Use markdown formatting (headers, bold, code blocks, lists)
+- Your output is rendered in the terminal with syntax highlighting
+- Keep responses focused and actionable
 
 Be helpful, accurate, and fast.`;
 }
 
-/**
- * Print the welcome banner.
- */
-function printWelcome(model: string): void {
+/** Create a system message. */
+function createSystemMessage(): ConversationMessage {
+  return {
+    id: generateId(),
+    role: 'system',
+    content: buildSystemPrompt(),
+    timestamp: now(),
+  };
+}
+
+/** Initialize a new session in SQLite. */
+function initNewSession(model: string): string {
+  try {
+    const session = createSession(process.cwd(), model);
+    logger.debug(`New session created: ${session.id}`);
+    return session.id;
+  } catch (error) {
+    logger.debug(`Session storage unavailable: ${error}`);
+    return generateId();
+  }
+}
+
+/** End the session gracefully. */
+async function endSession(state: SessionState): Promise<void> {
+  const duration = formatDuration(Date.now() - state.startTime);
   console.error('');
-  console.error(chalk.bold.cyan('  ⚡ Free-CLI') + chalk.gray(' — Your terminal. Your AI. Groq fast.'));
-  console.error(chalk.gray(`  Model: ${model}`));
-  console.error(chalk.gray('  Type /help for commands, /exit to quit.'));
+  console.error(
+    chalk.gray(
+      `👋 Session ended — ${state.messageCount} messages, ${state.tokens.totalTokens.toLocaleString()} tokens, ${duration}`,
+    ),
+  );
+
+  try {
+    updateSession(state.sessionId, {
+      status: 'completed',
+      totalTokens: state.tokens,
+    });
+  } catch {
+    // Session storage may not be available
+  }
+}
+
+/**
+ * Print the welcome banner with gradient.
+ */
+function printWelcome(state: SessionState): void {
+  const banner = gradientString.pastel.multiline(
+    [
+      '╔══════════════════════════════════════════════╗',
+      '║            ⚡  F R E E - C L I  ⚡          ║',
+      '║   Your terminal. Your AI. Groq fast.        ║',
+      '╚══════════════════════════════════════════════╝',
+    ].join('\n'),
+  );
+
+  console.error('');
+  console.error(banner);
+  console.error('');
+
+  const info = [
+    `${chalk.gray('Model:')}   ${chalk.cyan(state.model)}`,
+    `${chalk.gray('Session:')} ${chalk.yellow(state.sessionId.slice(0, 8))}`,
+    `${chalk.gray('Help:')}    ${chalk.white('/help')}  ${chalk.gray('Exit:')} ${chalk.white('/exit')}`,
+  ].join('\n');
+
+  console.error(
+    boxen(info, {
+      padding: { top: 0, bottom: 0, left: 1, right: 1 },
+      borderStyle: 'round',
+      borderColor: 'gray',
+      dimBorder: true,
+    }),
+  );
+
   console.error('');
 }
 
@@ -312,10 +509,15 @@ function printWelcome(model: string): void {
 function printSlashHelp(): void {
   console.error('');
   console.error(chalk.bold('  Available Commands:'));
-  console.error(chalk.gray('  /clear     ') + 'Clear conversation context');
-  console.error(chalk.gray('  /model     ') + 'Show current model');
-  console.error(chalk.gray('  /tools     ') + 'List available tools');
-  console.error(chalk.gray('  /help      ') + 'Show this help message');
-  console.error(chalk.gray('  /exit      ') + 'Exit the chat');
+  console.error('');
+  console.error(chalk.cyan('  /clear     ') + chalk.gray('Clear conversation context'));
+  console.error(chalk.cyan('  /reset     ') + chalk.gray('Start a fresh session'));
+  console.error(chalk.cyan('  /model     ') + chalk.gray('Show or switch model (/model llama-3.1-8b-instant)'));
+  console.error(chalk.cyan('  /history   ') + chalk.gray('Show recent sessions'));
+  console.error(chalk.cyan('  /tokens    ') + chalk.gray('Show token usage for this session'));
+  console.error(chalk.cyan('  /compact   ') + chalk.gray('Compact context to last N messages'));
+  console.error(chalk.cyan('  /tools     ') + chalk.gray('List available tools (Phase 2)'));
+  console.error(chalk.cyan('  /help      ') + chalk.gray('Show this help message'));
+  console.error(chalk.cyan('  /exit      ') + chalk.gray('End the session'));
   console.error('');
 }

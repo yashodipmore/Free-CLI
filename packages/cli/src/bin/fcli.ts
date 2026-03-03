@@ -1,5 +1,5 @@
 /**
- * @free-cli/cli — Main Entry Point
+ * @free-cli/cli — Main Entry Point (Phase 1)
  *
  * #!/usr/bin/env node
  *
@@ -33,8 +33,9 @@ function createProgram(): Command {
     .version(VERSION, '-v, --version', 'Show version number')
     .option('--verbose', 'Enable verbose debug logging', false)
     .option('--model <model>', 'Override the default model for this session')
+    .option('--resume <id>', 'Resume a previous session by ID')
     .argument('[prompt...]', 'One-shot prompt (runs and exits)')
-    .action(async (promptParts: string[], options: { model?: string; verbose?: boolean }) => {
+    .action(async (promptParts: string[], options: { model?: string; verbose?: boolean; resume?: string }) => {
       // If prompt parts were given, combine them into one prompt string
       const prompt = promptParts.length > 0 ? promptParts.join(' ') : undefined;
 
@@ -52,13 +53,22 @@ function createProgram(): Command {
       await configCommand(action, args);
     });
 
-  // Doctor command (placeholder for Phase 2)
+  // Doctor command
   program
     .command('doctor')
     .description('Diagnose environment and configuration')
     .action(async () => {
       const { doctorCommand } = await import('../commands/doctor.js');
       await doctorCommand();
+    });
+
+  // History command
+  program
+    .command('history [action] [args...]')
+    .description('Manage session history (list/show/clear/delete)')
+    .action(async (action: string | undefined, args: string[]) => {
+      const { historyCommand } = await import('../commands/history.js');
+      await historyCommand(action, args);
     });
 
   return program;

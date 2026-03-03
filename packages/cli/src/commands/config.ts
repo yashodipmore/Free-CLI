@@ -1,13 +1,15 @@
 /**
- * @free-cli/cli — Config Command
+ * @free-cli/cli — Config Command (Phase 1)
  *
  * Set up and manage API keys and user preferences.
+ * Features gradient banner and polished setup wizard.
  */
 
 import chalk from 'chalk';
+import gradientString from 'gradient-string';
+import boxen from 'boxen';
 import { input, select } from '@inquirer/prompts';
 import { setApiKey, getApiKey, setConfig, getConfig, resetConfig } from '../storage/config.js';
-import { logger } from '../utils/logger.js';
 
 /**
  * Run the config wizard — interactive API key and preferences setup.
@@ -42,9 +44,28 @@ export async function configCommand(
  * Interactive setup wizard for first-run configuration.
  */
 export async function configWizard(): Promise<void> {
+  const banner = gradientString.pastel.multiline(
+    [
+      '╔══════════════════════════════════════════════╗',
+      '║            ⚡  F R E E - C L I  ⚡          ║',
+      '║   Your terminal. Your AI. Groq fast.        ║',
+      '╚══════════════════════════════════════════════╝',
+    ].join('\n'),
+  );
+
   console.error('');
-  console.error(chalk.bold.cyan('  ⚡ Free-CLI Setup'));
-  console.error(chalk.gray('  Let\'s get you configured.\n'));
+  console.error(banner);
+  console.error('');
+
+  console.error(
+    boxen(chalk.bold('Welcome! Let\'s set up Free-CLI in 30 seconds.'), {
+      padding: { top: 0, bottom: 0, left: 1, right: 1 },
+      borderStyle: 'round',
+      borderColor: 'cyan',
+      dimBorder: true,
+    }),
+  );
+  console.error('');
 
   // Groq API Key
   const existingKey = await getApiKey('groq');

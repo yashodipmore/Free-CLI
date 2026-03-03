@@ -48,21 +48,31 @@
   },
   "dependencies": {
     "@free-cli/core": "workspace:*",
-    "commander": "^12.1.0",
-    "groq-sdk": "^0.12.0",
-    "chalk": "^5.4.0",
-    "ora": "^8.2.0",
     "@inquirer/prompts": "^7.3.0",
-    "boxen": "^8.0.1",
+    "better-sqlite3": "^12.6.2",
+    "boxen": "8",
+    "chalk": "^5.4.0",
+    "cli-highlight": "^2.1.11",
+    "commander": "^12.1.0",
     "configstore": "^7.0.0",
+    "diff2html": "^3.4.56",
+    "gradient-string": "^3.0.0",
+    "groq-sdk": "^0.12.0",
+    "ink": "^5.2.1",
+    "keytar": "^7.9.0",
     "marked": "^15.0.0",
-    "marked-terminal": "^7.3.0",
-    "keytar": "^7.9.0"
+    "marked-terminal": "7",
+    "ora": "^8.2.0",
+    "react": "^18.3.1"
   },
   "devDependencies": {
-    "tsup": "^8.4.0",
-    "typescript": "^5.7.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/configstore": "^6.0.2",
+    "@types/diff2html": "^3.0.3",
+    "@types/gradient-string": "^1.1.6",
     "@types/node": "^22.0.0",
-    "@types/configstore": "^6.0.2"
+    "@types/react": "^19.2.14",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0"
   }
 }
