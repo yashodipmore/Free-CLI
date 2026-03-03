@@ -1,0 +1,7 @@
+dist
+node_modules
+.turbo
+.next
+coverage
+pnpm-lock.yaml
+*.db

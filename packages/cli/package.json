@@ -1,0 +1,68 @@
+{
+  "name": "free-cli",
+  "version": "0.1.0",
+  "description": "Enterprise-Grade AI Terminal Agent powered by Groq LPU — free, fast, open source",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "fcli": "./dist/bin/fcli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "groq",
+    "llm",
+    "terminal",
+    "agent",
+    "mcp",
+    "react-loop",
+    "free"
+  ],
+  "author": "Yashodip More",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yashodip-more/free-cli"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/",
+    "clean": "rm -rf dist .turbo",
+    "start": "node dist/bin/fcli.js"
+  },
+  "dependencies": {
+    "@free-cli/core": "workspace:*",
+    "commander": "^12.1.0",
+    "groq-sdk": "^0.12.0",
+    "chalk": "^5.4.0",
+    "ora": "^8.2.0",
+    "@inquirer/prompts": "^7.3.0",
+    "boxen": "^8.0.1",
+    "configstore": "^7.0.0",
+    "marked": "^15.0.0",
+    "marked-terminal": "^7.3.0",
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0",
+    "@types/configstore": "^6.0.2"
+  }
+}
