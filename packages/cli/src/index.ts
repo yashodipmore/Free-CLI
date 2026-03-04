@@ -28,4 +28,7 @@ export {
 } from './storage/sessions.js';
 export { renderMarkdown, renderCodeBlock } from './ui/renderer.js';
 export { logger } from './utils/logger.js';
+export { toolRegistry, initializeBuiltinTools } from './tools/index.js';
+export { Agent, createAgent } from './agent/core.js';
+export { ContextManager } from './agent/context.js';
 export { FreeCLIError, AuthenticationError, APIError, ToolExecutionError } from './utils/errors.js';

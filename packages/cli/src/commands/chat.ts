@@ -7,12 +7,11 @@
  */
 
 import chalk from 'chalk';
-import ora from 'ora';
 import boxen from 'boxen';
 import gradientString from 'gradient-string';
 import { input } from '@inquirer/prompts';
 import { generateId, now, formatDuration } from '@free-cli/core';
-import type { ConversationMessage, LLMStreamChunk, TokenUsage } from '@free-cli/core';
+import type { ConversationMessage, TokenUsage, AgentConfig, ApprovalMode } from '@free-cli/core';
 import { GroqProvider } from '../llm/groq.js';
 import { getConfig, getApiKey } from '../storage/config.js';
 import {
@@ -26,9 +25,8 @@ import {
 import { renderMarkdown as _renderMarkdown } from '../ui/renderer.js';
 import { logger } from '../utils/logger.js';
 import { AuthenticationError } from '../utils/errors.js';
-
-/** ANSI escape to clear the current line */
-const CLEAR_LINE = '\x1B[2K\r';
+import { initializeBuiltinTools, toolRegistry } from '../tools/index.js';
+import { createAgent } from '../agent/core.js';
 
 /** Session-level token accumulator */
 interface SessionState {
@@ -65,53 +63,59 @@ export async function chatCommand(
     logger.setLevel('debug');
   }
 
-  // One-shot mode
+  // Initialize built-in tools
+  const cwd = process.cwd();
+  initializeBuiltinTools(cwd);
+  logger.debug(`Registered ${toolRegistry.size} tools`);
+
+  // Build agent config
+  const agentConfig: AgentConfig = {
+    maxIterations: 20,
+    toolTimeout: 30_000,
+    approvalMode: (getConfig('approvalMode') as ApprovalMode) || 'ask',
+    model,
+    contextWindowTokens: 100_000,
+  };
+
+  // One-shot mode — use the agent for agentic task execution
   if (prompt) {
-    await executeOneShot(provider, model, prompt);
+    await executeOneShot(provider, model, prompt, agentConfig);
     return;
   }
 
   // Interactive REPL mode
-  await interactiveREPL(provider, model, options.resume);
+  await interactiveREPL(provider, model, options.resume, agentConfig);
 }
 
 /**
- * Execute a single prompt and stream the response with markdown rendering.
+ * Execute a single prompt using the full agent with tool calling.
  */
 async function executeOneShot(
   provider: GroqProvider,
   model: string,
   prompt: string,
+  agentConfig: AgentConfig,
 ): Promise<void> {
-  const messages: ConversationMessage[] = [
-    {
-      id: generateId(),
-      role: 'system',
-      content: buildSystemPrompt(),
-      timestamp: now(),
-    },
-    {
-      id: generateId(),
-      role: 'user',
-      content: prompt,
-      timestamp: now(),
-    },
-  ];
+  const agent = createAgent({ provider, config: agentConfig });
 
-  const result = await streamResponseWithMd(provider, model, messages);
-
-  if (result) {
-    logger.debug(`Response length: ${result.content.length} chars`);
+  try {
+    await agent.run(prompt);
+  } catch (error) {
+    if (error instanceof Error) {
+      console.error(chalk.red(`\n  ${error.message}`));
+      logger.debug(`Full error: ${error.stack}`);
+    }
   }
 }
 
 /**
- * Run the interactive REPL loop with session persistence.
+ * Run the interactive REPL loop with session persistence and agent tool calling.
  */
 async function interactiveREPL(
   provider: GroqProvider,
   model: string,
   resumeId?: string,
+  agentConfig?: AgentConfig,
 ): Promise<void> {
   // Initialize or resume session
   let messages: ConversationMessage[];
@@ -122,7 +126,7 @@ async function interactiveREPL(
     if (existingMessages.length === 0) {
       console.error(chalk.yellow(`Session ${resumeId} not found. Starting new session.`));
       sessionId = initNewSession(model);
-      messages = [createSystemMessage()];
+      messages = [];
     } else {
       sessionId = resumeId;
       messages = existingMessages;
@@ -130,7 +134,22 @@ async function interactiveREPL(
     }
   } else {
     sessionId = initNewSession(model);
-    messages = [createSystemMessage()];
+    messages = [];
+  }
+
+  // Create the agent
+  const config = agentConfig ?? {
+    maxIterations: 20,
+    toolTimeout: 30_000,
+    approvalMode: 'ask' as ApprovalMode,
+    model,
+    contextWindowTokens: 100_000,
+  };
+  const agent = createAgent({ provider, config });
+
+  // Load existing messages into agent if resuming
+  if (messages.length > 0) {
+    agent.loadMessages(messages);
   }
 
   const state: SessionState = {
@@ -169,7 +188,7 @@ async function interactiveREPL(
 
     // Handle slash commands
     if (trimmed.startsWith('/')) {
-      const result = await handleSlashCommand(trimmed, messages, state, provider);
+      const result = await handleSlashCommand(trimmed, agent.getMessages(), state, provider);
       if (result === 'exit') {
         await endSession(state);
         break;
@@ -177,112 +196,38 @@ async function interactiveREPL(
       if (result === 'handled') continue;
     }
 
-    // Add user message
-    const userMsg: ConversationMessage = {
-      id: generateId(),
-      role: 'user',
-      content: trimmed,
-      timestamp: now(),
-    };
-    messages.push(userMsg);
-    addMessage(sessionId, userMsg);
-    state.messageCount++;
+    // Run the agent with the user's prompt
+    try {
+      await agent.run(trimmed);
 
-    // Stream AI response
-    const result = await streamResponseWithMd(provider, model, messages);
+      // Sync token usage from agent
+      const agentTokens = agent.getTokenUsage();
+      state.tokens = agentTokens;
+      state.messageCount = agent.getMessages().filter((m) => m.role !== 'system').length;
 
-    // Add assistant response to history
-    if (result) {
-      const assistantMsg: ConversationMessage = {
-        id: generateId(),
-        role: 'assistant',
-        content: result.content,
-        timestamp: now(),
-      };
-      messages.push(assistantMsg);
-      addMessage(sessionId, assistantMsg);
-      state.messageCount++;
-
-      // Track tokens
-      if (result.usage) {
-        state.tokens.promptTokens += result.usage.promptTokens;
-        state.tokens.completionTokens += result.usage.completionTokens;
-        state.tokens.totalTokens += result.usage.totalTokens;
+      // Persist to session storage
+      const agentMessages = agent.getMessages();
+      const lastMessages = agentMessages.slice(-10); // Persist recent messages
+      for (const msg of lastMessages) {
+        try {
+          addMessage(sessionId, msg);
+        } catch {
+          // Might already exist, that's fine
+        }
       }
 
       // Auto-title after first exchange
-      if (state.messageCount === 2) {
+      if (state.messageCount <= 3) {
         autoTitleSession(sessionId, trimmed);
+      }
+    } catch (error) {
+      if (error instanceof Error) {
+        console.error(chalk.red(`\n  Error: ${error.message}`));
+        logger.debug(`Full error: ${error.stack}`);
       }
     }
 
     console.error(''); // Blank line between turns
-  }
-}
-
-/** Stream response and return content + usage. */
-async function streamResponseWithMd(
-  provider: GroqProvider,
-  model: string,
-  messages: ConversationMessage[],
-): Promise<{ content: string; usage?: TokenUsage } | null> {
-  const spinner = ora({
-    text: chalk.gray('Thinking...'),
-    spinner: 'dots',
-    stream: process.stderr,
-  }).start();
-
-  let fullContent = '';
-  let firstToken = true;
-  let usage: TokenUsage | undefined;
-
-  try {
-    const stream = provider.chatStream({
-      model,
-      messages,
-      stream: true,
-      temperature: 0.7,
-    });
-
-    for await (const chunk of stream as AsyncIterable<LLMStreamChunk>) {
-      if (firstToken && chunk.content) {
-        spinner.stop();
-        process.stderr.write(CLEAR_LINE);
-        firstToken = false;
-      }
-
-      if (chunk.content) {
-        fullContent += chunk.content;
-        process.stdout.write(chunk.content);
-      }
-
-      if (chunk.done && chunk.usage) {
-        usage = chunk.usage;
-        logger.debug(
-          `Tokens — prompt: ${chunk.usage.promptTokens}, completion: ${chunk.usage.completionTokens}, total: ${chunk.usage.totalTokens}`,
-        );
-      }
-    }
-
-    if (firstToken) {
-      spinner.stop();
-    }
-
-    // Ensure newline after streaming
-    if (fullContent && !fullContent.endsWith('\n')) {
-      process.stdout.write('\n');
-    }
-
-    return fullContent ? { content: fullContent, usage } : null;
-  } catch (error) {
-    spinner.fail(chalk.red('Error'));
-
-    if (error instanceof Error) {
-      console.error(chalk.red(`\n  ${error.message}`));
-      logger.debug(`Full error: ${error.stack}`);
-    }
-
-    return null;
   }
 }
 
@@ -378,9 +323,27 @@ async function handleSlashCommand(
       return 'handled';
     }
 
-    case '/tools':
-      console.error(chalk.gray('🔧 Tools will be available in Phase 2.'));
+    case '/tools': {
+      const tools = toolRegistry.getAll();
+      if (tools.length === 0) {
+        console.error(chalk.gray('No tools registered.'));
+      } else {
+        console.error(chalk.bold('\n  Available Tools:\n'));
+        for (const tool of tools) {
+          const safety = tool.safetyLevel === 'read-only'
+            ? chalk.green(tool.safetyLevel)
+            : tool.safetyLevel === 'safe-write'
+              ? chalk.yellow(tool.safetyLevel)
+              : chalk.red(tool.safetyLevel);
+          console.error(
+            chalk.cyan(`  ${tool.name}`) +
+              chalk.gray(` [${safety}${chalk.gray(']')} — ${tool.description.slice(0, 60)}...`),
+          );
+        }
+        console.error('');
+      }
       return 'handled';
+    }
 
     case '/help':
       printSlashHelp();
@@ -394,6 +357,7 @@ async function handleSlashCommand(
 
 /**
  * Build the system prompt with current environment context.
+ * (Used as a fallback — the agent's ContextManager builds a richer prompt.)
  */
 function buildSystemPrompt(): string {
   const cwd = process.cwd();
@@ -401,7 +365,9 @@ function buildSystemPrompt(): string {
   const platform = process.platform;
   const date = new Date().toISOString().split('T')[0];
 
-  return `You are Free-CLI (fcli), an AI coding assistant running in the user's terminal.
+  const toolCount = toolRegistry.size;
+
+  return `You are Free-CLI (fcli), an AI coding agent running in the user's terminal.
 You are powered by Groq's LPU inference engine for blazing-fast responses.
 
 ## Current Environment
@@ -409,14 +375,15 @@ You are powered by Groq's LPU inference engine for blazing-fast responses.
 - Platform: ${platform}
 - Node.js: ${nodeVersion}
 - Date: ${date}
+- Tools available: ${toolCount}
 
 ## Guidelines
 - Be concise and direct — this is a terminal, not a chat app
 - When showing code, use markdown code blocks with language identifiers
 - If you need to explain something, use bullet points
 - For file edits, show the exact changes needed
-- If asked about your capabilities, mention you can help with coding, debugging, file operations, and general knowledge
-- You are in Phase 1 — interactive chat with rich terminal output. Full agentic tool calling is coming in Phase 2.
+- You are an agentic AI — use tools to read, write, and execute code
+- IMPORTANT: When you have completed the task, stop calling tools and give your final response
 
 ## Response Formatting
 - Use markdown formatting (headers, bold, code blocks, lists)
